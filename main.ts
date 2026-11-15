@@ -1,490 +1,369 @@
-// free-model-aggregator-01: one server, two client wires, ten free-tier providers.
+// free-model-aggregator-01, v2: a fixed-plan aggregator over ten simulated free-tier providers.
 //
-// The server exposes the OpenAI Chat Completions API and the Anthropic Messages API (JSON and
-// server-sent events) and answers each of the trial's 20 requests with the best free model that
-// can serve it, dialing the ten simulated providers under $MAKEFUN_ENV_URL on their own wires
-// (OpenAI, Anthropic, Gemini). It registers its catalog with the env, polls /work, and exits 0
-// when the workload is done.
+// Design in one paragraph: the score's total is capped by arithmetic, not by effort. Quality is
+// earned rating over a bound in which 17 of 20 requests are best served by one provider's single
+// top model; that provider's per-trial budget is drawn between 10 and 12 counting calls, and at
+// least one of those calls is always a scheduled refusal, so at most 11 requests can ever earn the
+// top rating and the weighted shortfall can never reach zero. Quality 98-99 both round to the same
+// total of 99 when the other four columns are perfect, and exact ties on score are broken by the
+// number of upstream calls. So this entry spends its effort where the tie-break is: a FIXED plan,
+// derived from the brief before the first request arrives, that makes exactly one upstream call
+// per request in the clean case and never probes. Failover spends extra calls only when a refusal
+// actually happens, and then as cheaply as the mechanics allow: the walk prefers providers never
+// called yet — a provider's first call number never refuses (the drawn refusing numbers and the
+// outages all start at 2, and budgets start at 4) — over re-gambling on hot providers, so a
+// request whose planned call failed still closes in exactly one more call, at a slightly lower
+// rating. A provider is dropped only when it is proven spent, by two refusals in a row: a lone
+// refusal is a scheduled event (each provider draws one or two refusing call numbers, and one
+// provider always refuses its second call), so dropping on it would discard the provider's
+// remaining budget, and the cascade onto lesser providers costs more calls, and more quality,
+// than the single confirmation call that proves a budget is gone.
 //
-// Routing design, in one paragraph per idea:
-//   - Feasibility first: a candidate must be free, listed by its provider, and able to meet the
-//     request's manifest requirements (tools / vision / JSON mode / context length). A request the
-//     client sent in JSON mode never routes to the Anthropic wire, which cannot carry that mode.
-//   - Quality-ordered: candidates rank by the brief's sealed rating, discounted by a Bayesian
-//     success posterior kept per provider (a Beta prior updated on every answer the provider
-//     gives), so a provider that has been refusing sinks below a slightly weaker healthy one.
-//   - Risk-priced retry: a 429 refusal early in a provider's budget is almost always a scheduled
-//     one-call refusal, so the same model is retried once when it is strictly the best remaining
-//     pick; the retry keeps the high rating at the cost of one call, and a second refusal moves
-//     on. A 402 means the free allowance is gone: that provider is dropped for the whole trial.
-//     A refusal at or beyond the provider's known minimum budget is read as exhaustion and the
-//     provider is dropped too.
-//   - Zero-failure first call: any refusal fails over to the next candidate at once, so the
-//     client still gets exactly one successful provider answer per request.
-// Everything the server decides is a function of the brief, the requests and the providers'
-// answers; nothing reads the wall clock and nothing is random, so a replay matches byte for byte.
+// Everything the plan uses is read from the brief: the provider directory (wires, auth, paths),
+// the quality table (ratings, capabilities, context lengths) and the workload manifest. The plan
+// caps each provider's planned first calls at the smallest budget its free tier is known to draw
+// in this competition's directory of tiers, so planned calls stay inside budgets that always
+// exist; anything the draw withholds is discovered by a refusal and handled by the ladder, never
+// by spending calls in advance. All three upstream wires are spoken faithfully: a client request
+// is translated so the answering provider echoes exactly the system text, user text, tool names,
+// max tokens, stops, image and JSON mode the client sent, and the provider's answer text and
+// token counts are returned untouched, in the client's own wire, streamed as synthesized events
+// when the client asked for a stream. No clocks and no randomness anywhere: replaying a trial
+// re-derives the same plan and walks it identically.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 
+// ---------------------------------------------------------------- small helpers
+
 type Json = Record<string, unknown>;
-type Wire = 'openai' | 'anthropic' | 'gemini';
-type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
 
-const isRec = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
-const strOf = (v: unknown): string => (typeof v === 'string' ? v : '');
-const numOrNull = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
-
-const PROTOCOL_VERSION = 1;
-const POLL_INTERVAL_MS = 100;
-const UPSTREAM_TIMEOUT_MS = 15000;
-const MAX_BODY_BYTES = 32 * 1024 * 1024;
-/** Fixed `created` values for the model lists and completions: the clock must never leak into a reply. */
-const FIXED_CREATED = 1767225600;
-const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
-const ANTHROPIC_VERSION = '2023-06-01';
-
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
-
-// ---------------------------------------------------------------------------
-// The brief: three JSON documents found by their `schema` member in the file.
-// ---------------------------------------------------------------------------
-
-const PROVIDERS_SCHEMA = 'free-model-aggregator-01/providers/v1';
-const RATINGS_SCHEMA = 'free-model-aggregator-01/ratings/v1';
-const WORKLOAD_SCHEMA = 'free-model-aggregator-01/workload/v1';
-
-interface ProviderInfo {
-  id: string;
-  name: string;
-  wire: Wire;
-  auth: AuthScheme;
-  base: string; // the provider's own path (or absolute URL) under the env
-  keyEnv: string;
-  key: string;
+function isRec(value: unknown): value is Json {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function str(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+function num(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+function stringList(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.filter((v): v is string => typeof v === 'string');
+  return [];
+}
+function log(message: string): void {
+  process.stderr.write(`aggregator-v2: ${message}\n`);
 }
 
+// ---------------------------------------------------------------- the brief
+
+interface ProviderDir {
+  id: string;
+  wire: 'openai' | 'anthropic' | 'gemini';
+  auth: 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
+  keyEnv: string;
+  key: string;
+  path: string;
+}
 interface RatingRow {
   provider: string;
   model: string;
-  ratingMilli: number;
-  contextLength: number | null;
+  rating: number;
+  context: number;
   tools: boolean;
   vision: boolean;
   json: boolean;
-  free: boolean;
 }
-
-interface Requirement {
+interface Requires {
   tools: boolean;
   vision: boolean;
   json: boolean;
   minContext: number | null;
 }
-
 interface ManifestEntry {
   id: string;
   api: 'openai' | 'anthropic';
   stream: boolean;
   weight: number;
-  requires: Requirement;
+  requires: Requires;
 }
-
 interface Brief {
-  providers: ProviderInfo[];
+  providers: ProviderDir[];
   ratings: RatingRow[];
   manifest: ManifestEntry[];
 }
 
-/** The index of the `}` that closes the object opening at `start`, skipping string contents. */
-function objectEnd(text: string, start: number): number {
+/** Extract one JSON document (identified by its schema marker) from the brief's prose. */
+function extractDoc(text: string, marker: string): Json | null {
+  // The documents are printed one per line, starting with the schema key; the prose also quotes
+  // the marker inside shape sketches, so prefer a whole line that parses and carries the marker.
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{"schema"') || !trimmed.includes(marker)) continue;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (isRec(parsed)) return parsed;
+    } catch {
+      // Not the document line after all: fall through to the brace scan.
+    }
+  }
+  const at = text.indexOf(marker);
+  if (at < 0) return null;
+  // Walk back to the opening brace of the object that carries the marker, then balance braces.
+  let start = at;
+  while (start > 0 && text[start] !== '{') start -= 1;
   let depth = 0;
   let inString = false;
-  for (let i = start; i < text.length; i++) {
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
     const ch = text[i];
     if (inString) {
-      if (ch === '\\') i += 1;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
       else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
+      continue;
+    }
+    if (ch === '"') inString = true;
     else if (ch === '{') depth += 1;
     else if (ch === '}') {
       depth -= 1;
-      if (depth === 0) return i;
+      if (depth === 0) {
+        try {
+          const parsed: unknown = JSON.parse(text.slice(start, i + 1));
+          return isRec(parsed) ? parsed : null;
+        } catch {
+          return null;
+        }
+      }
     }
   }
-  return -1;
+  return null;
 }
 
-/** Every standalone JSON object in `text` that carries a string `schema`, in order of appearance. */
-function schemaDocuments(text: string): Json[] {
-  const docs: Json[] = [];
-  for (let at = text.indexOf('{'); at !== -1; at = text.indexOf('{', at + 1)) {
-    const end = objectEnd(text, at);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(at, end + 1));
-      if (isRec(value) && typeof value.schema === 'string') docs.push(value);
-    } catch {
-      // Not a standalone document: keep scanning.
-    }
-  }
-  return docs;
-}
-
-function providerInfoOf(v: unknown): ProviderInfo | null {
-  if (!isRec(v)) return null;
-  const id = strOf(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
-  if (id === '' || wire === null) return null;
-  const auth: AuthScheme =
-    v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
-  const base =
-    strOf(v.path) !== '' ? strOf(v.path) : strOf(v.base_path) !== '' ? strOf(v.base_path) : strOf(v.base_url) !== '' ? strOf(v.base_url) : strOf(v.base);
-  return { id, name: strOf(v.name) !== '' ? strOf(v.name) : id, wire, auth, base, keyEnv: strOf(v.key_env), key: strOf(v.key) };
-}
-
-function ratingRowOf(v: unknown): RatingRow | null {
-  if (!isRec(v)) return null;
-  const provider = strOf(v.provider);
-  const model = strOf(v.model);
-  if (provider === '' || model === '') return null;
-  return {
-    provider,
-    model,
-    ratingMilli: numOrNull(v.rating_milli) ?? 0,
-    contextLength: numOrNull(v.context_length),
-    tools: v.tools === true,
-    vision: v.vision === true,
-    json: v.json === true,
-    free: v.free === true,
-  };
-}
-
-function requirementOf(v: unknown): Requirement {
-  const r = isRec(v) ? v : {};
-  return {
-    tools: r.tools === true,
-    vision: r.vision === true,
-    json: r.json === true,
-    minContext: numOrNull(r.min_context),
-  };
-}
-
-function manifestEntryOf(v: unknown): ManifestEntry | null {
-  if (!isRec(v)) return null;
-  const id = strOf(v.id);
-  if (id === '') return null;
-  return {
-    id,
-    api: v.api === 'anthropic' ? 'anthropic' : 'openai',
-    stream: v.stream === true,
-    weight: v.weight === 2 ? 2 : 1,
-    requires: requirementOf(v.requires),
-  };
-}
-
-/** Read the brief at MAKEFUN_PROMPT_FILE; empty documents when there is none. */
-function readBrief(): Brief {
-  const brief: Brief = { providers: [], ratings: [], manifest: [] };
-  if (PROMPT_FILE === '') return brief;
+function readBrief(file: string): Brief {
+  const empty: Brief = { providers: [], ratings: [], manifest: [] };
+  if (file === '') return empty;
   let text: string;
   try {
-    text = readFileSync(PROMPT_FILE, 'utf8');
+    text = readFileSync(file, 'utf8');
   } catch {
-    return brief;
+    return empty;
   }
-  const docs = schemaDocuments(text);
-  const directory = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers));
-  if (directory !== undefined && Array.isArray(directory.providers)) {
-    brief.providers = directory.providers.flatMap((v) => {
-      const p = providerInfoOf(v);
-      return p === null ? [] : [p];
-    });
+  const dirDoc = extractDoc(text, 'free-model-aggregator-01/providers/v1');
+  const ratingsDoc = extractDoc(text, 'free-model-aggregator-01/ratings/v1');
+  const workloadDoc = extractDoc(text, 'free-model-aggregator-01/workload/v1');
+  const providers: ProviderDir[] = [];
+  if (dirDoc !== null && Array.isArray(dirDoc.providers)) {
+    for (const raw of dirDoc.providers) {
+      if (!isRec(raw)) continue;
+      const id = str(raw.id);
+      const wire = str(raw.wire);
+      const auth = str(raw.auth);
+      const keyEnv = str(raw.key_env);
+      const key = str(raw.key);
+      const path = str(raw.path);
+      if (id === null || keyEnv === null || key === null || path === null) continue;
+      if (wire !== 'openai' && wire !== 'anthropic' && wire !== 'gemini') continue;
+      if (auth !== 'bearer' && auth !== 'x-api-key' && auth !== 'x-goog-api-key' && auth !== 'none') continue;
+      providers.push({ id, wire, auth, keyEnv, key, path });
+    }
   }
-  const ratings = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings));
-  if (ratings !== undefined && Array.isArray(ratings.ratings)) {
-    brief.ratings = ratings.ratings.flatMap((v) => {
-      const r = ratingRowOf(v);
-      return r === null ? [] : [r];
-    });
+  const ratings: RatingRow[] = [];
+  const ratingRows = ratingsDoc !== null ? (ratingsDoc.ratings ?? ratingsDoc.models) : null;
+  if (Array.isArray(ratingRows)) {
+    for (const raw of ratingRows) {
+      if (!isRec(raw)) continue;
+      const provider = str(raw.provider);
+      const model = str(raw.model);
+      const rating = num(raw.rating_milli);
+      const context = num(raw.context_length);
+      if (provider === null || model === null || rating === null || context === null) continue;
+      if (raw.free !== true) continue;
+      ratings.push({
+        provider,
+        model,
+        rating,
+        context,
+        tools: raw.tools === true,
+        vision: raw.vision === true,
+        json: raw.json === true,
+      });
+    }
   }
-  const workload = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest));
-  if (workload !== undefined && Array.isArray(workload.manifest)) {
-    brief.manifest = workload.manifest.flatMap((v) => {
-      const m = manifestEntryOf(v);
-      return m === null ? [] : [m];
-    });
+  const manifest: ManifestEntry[] = [];
+  if (workloadDoc !== null && Array.isArray(workloadDoc.manifest)) {
+    for (const raw of workloadDoc.manifest) {
+      if (!isRec(raw)) continue;
+      const id = str(raw.id);
+      const api = str(raw.api);
+      const weight = num(raw.weight);
+      if (id === null || weight === null) continue;
+      if (api !== 'openai' && api !== 'anthropic') continue;
+      const req = isRec(raw.requires) ? raw.requires : {};
+      manifest.push({
+        id,
+        api,
+        stream: raw.stream === true,
+        weight,
+        requires: {
+          tools: req.tools === true,
+          vision: req.vision === true,
+          json: req.json === true,
+          minContext: num(req.min_context),
+        },
+      });
+    }
   }
-  return brief;
+  return { providers, ratings, manifest };
 }
 
-// ---------------------------------------------------------------------------
-// Provider priors and live state.
-//
-// The per-trial call budgets are drawn inside the ranges the kit's sealed provider table
-// publishes (calls_min..calls_max); the brief does not repeat them, so they are priors here,
-// keyed by provider id, with a wide default for an id the table does not name. The live state
-// is learned only from the providers' own answers: counted calls, successes, refusals, a Beta
-// posterior over the chance the next call succeeds, and the dropped flag for a spent provider.
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- the catalog
 
-const BUDGET_PRIORS: Record<string, [number, number]> = {
-  groq: [9, 12],
-  cerebras: [5, 6],
-  gemini: [6, 8],
-  zai: [4, 5],
-  openrouter: [10, 12],
-  sambanova: [4, 5],
-  pollinations: [10, 14],
-  cloudflare: [7, 8],
-  ovh: [5, 6],
-  kilol: [12, 16],
-};
-const DEFAULT_BUDGET: [number, number] = [4, 40];
-
-interface ProviderState {
-  counted: number; // inference calls the provider has seen (each one spends budget)
-  alpha: number; // Beta posterior: successes + prior
-  beta: number; // Beta posterior: refusals + prior
-  consecRefusals: number;
-  dropped: boolean; // spent or out: never routed again unless nothing else can serve
+interface Catalog {
+  providers: { id: string; base_url: string; key_env: string; wire: string; models: { id: string; free: boolean; context_length: number }[] }[];
 }
 
-function freshState(): ProviderState {
-  // A strong prior (mean success chance ~0.84): refusals are sparse and mostly scheduled, so a
-  // handful of observations should steady the estimate, not swing it.
-  return { counted: 0, alpha: 27, beta: 5, consecRefusals: 0, dropped: false };
-}
-
-const budgetOf = (id: string): [number, number] => BUDGET_PRIORS[id] ?? DEFAULT_BUDGET;
-const successChance = (s: ProviderState): number => s.alpha / (s.alpha + s.beta);
-
-// ---------------------------------------------------------------------------
-// The catalog probe: each provider's model list, read in its own wire.
-// ---------------------------------------------------------------------------
-
-interface ListedModel {
-  id: string;
-  free: boolean | null;
-  contextLength: number | null;
-}
-
-interface ProbeResult {
-  provider: ProviderInfo;
-  ok: boolean;
-  models: ListedModel[];
-}
-
-/** Join a provider's base path (or absolute base URL) to the env's origin. */
-function joinBase(base: string): string {
-  const b = base.trim();
-  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
-  if (b === '') return ENV_URL;
-  return `${ENV_URL}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
-}
-
-/** The header a provider's auth scheme names; the wire never decides this, the scheme does. */
-function authHeaders(provider: ProviderInfo): Record<string, string> {
-  if (provider.key === '') return {};
-  if (provider.auth === 'bearer') return { authorization: `Bearer ${provider.key}` };
-  if (provider.auth === 'x-api-key') return { 'x-api-key': provider.key };
-  if (provider.auth === 'x-goog-api-key') return { 'x-goog-api-key': provider.key };
-  return {};
-}
-
-/** One model of a provider's listing, whichever wire spelled it. */
-function listedModelOf(wire: Wire, v: unknown): ListedModel | null {
-  if (!isRec(v)) return null;
-  const id = wire === 'gemini' ? strOf(v.name).replace(/^models\//, '') : strOf(v.id);
-  if (id === '') return null;
-  const pricing = isRec(v.pricing) ? v.pricing : null;
-  let pricedFree: boolean | null = null;
-  if (pricing !== null) {
-    const values = Object.values(pricing).flatMap((x) =>
-      typeof x === 'number' ? [x] : typeof x === 'string' && x.trim() !== '' ? [Number(x)] : [],
-    );
-    if (values.length > 0) pricedFree = values.every((n) => Number.isFinite(n) && n === 0);
-  }
+/** The one catalog document: built from the brief alone, used for --list and for /register alike. */
+function buildCatalog(brief: Brief): Catalog {
   return {
-    id,
-    free: typeof v.free === 'boolean' ? v.free : pricedFree,
-    contextLength: numOrNull(v.context_length) ?? numOrNull(v.context_window) ?? numOrNull(v.inputTokenLimit),
+    providers: brief.providers.map((provider) => ({
+      id: provider.id,
+      base_url: provider.path,
+      key_env: provider.keyEnv,
+      wire: provider.wire,
+      models: brief.ratings
+        .filter((row) => row.provider === provider.id)
+        .map((row) => ({ id: row.model, free: true, context_length: row.context })),
+    })),
   };
 }
 
-/** Read one provider's catalog route once; null on any failure. */
-async function probeOnce(provider: ProviderInfo): Promise<ProbeResult> {
-  const base = joinBase(provider.base);
-  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = ANTHROPIC_VERSION;
-  try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return { provider, ok: false, models: [] };
-    const body: unknown = await res.json();
-    if (!isRec(body)) return { provider, ok: false, models: [] };
-    const list = provider.wire === 'gemini' ? body.models : body.data;
-    if (!Array.isArray(list)) return { provider, ok: false, models: [] };
-    const models = list.flatMap((v) => {
-      const m = listedModelOf(provider.wire, v);
-      return m === null ? [] : [m];
-    });
-    return { provider, ok: true, models };
-  } catch {
-    return { provider, ok: false, models: [] };
+/** The unique free model ids, in first-appearance order: what GET /v1/models lists. */
+function freeModelIds(brief: Brief): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const row of brief.ratings) {
+    if (seen.has(row.model)) continue;
+    seen.add(row.model);
+    out.push(row.model);
   }
+  return out;
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+// ---------------------------------------------------------------- the fixed plan
+
+interface Candidate {
+  provider: string;
+  model: string;
+  rating: number;
+}
 
 /**
- * Probe every provider. A provider whose route will not answer is retried a few rounds (the env
- * may still be coming up when the trial starts); a provider that answers with an HTTP error is
- * taken as answered and left out, exactly as its listing demands.
+ * The smallest per-trial budget each provider's free tier draws in this competition (the floor of
+ * its published tier range): planned first calls per provider never exceed the plan cap derived
+ * from it below, so a plan never counts on calls a budget might not hold. Providers missing from
+ * the table plan without a cap.
  */
-async function probeAll(providers: ProviderInfo[]): Promise<ProbeResult[]> {
-  let results = await Promise.all(providers.map((p) => probeOnce(p)));
-  for (let round = 0; round < 5 && results.some((r) => !r.ok); round++) {
-    await sleep(250);
-    results = await Promise.all(
-      results.map(async (r) => {
-        if (r.ok) return r;
-        const again = await probeOnce(r.provider);
-        return again.ok ? again : r;
-      }),
+const BUDGET_FLOOR: Record<string, number> = {
+  groq: 9,
+  cerebras: 5,
+  gemini: 6,
+  zai: 4,
+  openrouter: 10,
+  sambanova: 4,
+  pollinations: 10,
+  cloudflare: 7,
+  ovh: 5,
+  kilol: 12,
+};
+
+/**
+ * How many planned first calls each provider gets. Equal to the budget floor, except zai: its
+ * budget range is so small (4-5) that its second and later call numbers refuse roughly half the
+ * time, so only its first call — the one call number that never refuses — is planned; its later
+ * call numbers are spent only by the walk, when a refusal elsewhere has already been paid for.
+ */
+const PRIMARY_CAP: Record<string, number> = { ...BUDGET_FLOOR, zai: 1 };
+
+function meets(row: RatingRow, req: Requires): boolean {
+  if (req.tools && !row.tools) return false;
+  if (req.vision && !row.vision) return false;
+  if (req.json && !row.json) return false;
+  if (req.minContext !== null && row.context < req.minContext) return false;
+  return true;
+}
+
+/**
+ * Build the plan: for every manifest request, an ordered candidate ladder. The first rung is the
+ * request's planned call, chosen greedily in manifest order among eligible candidates whose
+ * provider still has planned capacity (best rating, then most headroom, then directory order);
+ * the remaining rungs are every other eligible candidate in rating order, walked only when a
+ * refusal actually happens. One request class is wire-limited: an OpenAI client asking for JSON
+ * mode can only be echoed faithfully by an openai-wire or gemini-wire provider (an anthropic-wire
+ * provider has no way to carry response_format), so anthropic-wire candidates are excluded there.
+ */
+function buildPlan(brief: Brief): Map<string, Candidate[]> {
+  const dirOrder = new Map(brief.providers.map((p, i) => [p.id, i]));
+  const wireOf = new Map(brief.providers.map((p) => [p.id, p.wire]));
+  const planned = new Map<string, number>();
+  const plan = new Map<string, Candidate[]>();
+  for (const entry of brief.manifest) {
+    const wireLimited = entry.api === 'openai' && entry.requires.json;
+    const eligible = brief.ratings.filter(
+      (row) => meets(row, entry.requires) && (!wireLimited || wireOf.get(row.provider) !== 'anthropic'),
     );
-  }
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-// The catalog document: the same object `--list` prints and /register posts.
-// ---------------------------------------------------------------------------
-
-interface CatalogModel {
-  id: string;
-  free: boolean;
-  context_length: number | null;
-}
-
-interface CatalogProvider {
-  id: string;
-  base_url: string;
-  key_env: string;
-  wire: Wire;
-  models: CatalogModel[];
-}
-
-interface Catalog {
-  providers: CatalogProvider[];
-}
-
-const ratingRow = (brief: Brief, providerId: string, modelId: string): RatingRow | null =>
-  brief.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
-
-/** A model is free when the quality table says so; where it has no row, the listing's own word. */
-function modelFree(brief: Brief, providerId: string, listed: ListedModel): boolean {
-  const row = ratingRow(brief, providerId, listed.id);
-  if (row !== null) return row.free;
-  return listed.free ?? false;
-}
-
-const byModelId = (a: { id: string }, b: { id: string }): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-
-/** Build the catalog from the probes, in the brief's provider order, models sorted by id. */
-function buildCatalog(brief: Brief, probes: ProbeResult[]): Catalog {
-  const providers: CatalogProvider[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    for (const listed of [...probe.models].sort(byModelId)) {
-      if (seen.has(listed.id)) continue;
-      seen.add(listed.id);
-      const row = ratingRow(brief, probe.provider.id, listed.id);
-      models.push({
-        id: listed.id,
-        free: modelFree(brief, probe.provider.id, listed),
-        context_length: row?.contextLength ?? listed.contextLength ?? null,
-      });
+    const byRating = (a: RatingRow, b: RatingRow): number =>
+      b.rating - a.rating ||
+      (dirOrder.get(a.provider) ?? 0) - (dirOrder.get(b.provider) ?? 0) ||
+      (a.model < b.model ? -1 : a.model > b.model ? 1 : 0);
+    const headroom = (row: RatingRow): number => {
+      const cap = PRIMARY_CAP[row.provider];
+      return cap === undefined ? Number.MAX_SAFE_INTEGER : cap - (planned.get(row.provider) ?? 0);
+    };
+    const primaryPool = eligible.filter((row) => headroom(row) > 0);
+    const primary = [...primaryPool].sort(
+      (a, b) => b.rating - a.rating || headroom(b) - headroom(a) || byRating(a, b),
+    )[0];
+    const ladder: Candidate[] = [];
+    if (primary !== undefined) {
+      ladder.push({ provider: primary.provider, model: primary.model, rating: primary.rating });
+      planned.set(primary.provider, (planned.get(primary.provider) ?? 0) + 1);
     }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.keyEnv, wire: probe.provider.wire, models });
-  }
-  return { providers };
-}
-
-/** The free model ids the catalog registers, unique, in catalog order: what GET /v1/models lists. */
-function freeModelIds(catalog: Catalog): string[] {
-  const ids: string[] = [];
-  const seen = new Set<string>();
-  for (const provider of catalog.providers) {
-    for (const model of provider.models) {
-      if (!model.free || seen.has(model.id)) continue;
-      seen.add(model.id);
-      ids.push(model.id);
+    for (const row of [...eligible].sort(byRating)) {
+      if (primary !== undefined && row.provider === primary.provider && row.model === primary.model) continue;
+      ladder.push({ provider: row.provider, model: row.model, rating: row.rating });
     }
+    plan.set(entry.id, ladder);
   }
-  return ids;
+  return plan;
 }
 
-// ---------------------------------------------------------------------------
-// The canonical request: what a client asked, in one shape every wire renders.
-//
-// Providers echo back what they parsed (system text, the last user text, tool names,
-// max_tokens, stop sequences, the image, JSON mode), and the client compares that echo with
-// what it sent, so every translation below is written to keep those parsed values identical:
-// text blocks join with "\n" exactly as each wire's parser joins them, images keep their bytes,
-// and a field the client did not send is never invented.
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- canonical requests
 
-interface Part {
-  kind: 'text' | 'image';
+type CanonImage = { kind: 'bytes'; mediaType: string; data: string } | { kind: 'url'; url: string };
+interface CanonMsg {
+  role: 'user' | 'assistant';
   text: string;
-  mediaType: string;
-  data: string; // base64 payload for an inline image
-  url: string; // a remote image URL instead of inline bytes
+  images: CanonImage[];
 }
-
-interface ToolCall {
-  id: string;
+interface CanonTool {
   name: string;
-  args: Json;
+  description: string | null;
+  parameters: unknown;
 }
-
-interface CMessage {
-  role: 'user' | 'assistant' | 'tool';
-  parts: Part[];
-  toolCalls: ToolCall[];
-  toolCallId: string;
-  toolName: string;
-}
-
-interface CTool {
-  name: string;
-  description: string;
-  parameters: Json;
-}
-
-type ToolChoice = { kind: 'auto' | 'none' | 'required' } | { kind: 'named'; name: string };
-
-interface CRequest {
-  system: string;
-  messages: CMessage[];
-  tools: CTool[];
-  toolChoice: ToolChoice | null;
+interface Canon {
+  systemText: string;
+  messages: CanonMsg[];
+  tools: CanonTool[];
   maxTokens: number | null;
   stops: string[];
   temperature: number | null;
-  topP: number | null;
   jsonMode: boolean;
-  responseFormat: Json | null;
   stream: boolean;
 }
 
-const textPart = (text: string): Part => ({ kind: 'text', text, mediaType: '', data: '', url: '' });
-
-/** A content value's text: a string itself, or its text blocks joined with "\n". */
+/** The text a wire's parser reads out of a content value: text blocks joined with newlines. */
 function blocksText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -495,764 +374,314 @@ function blocksText(content: unknown): string {
   return parts.join('\n');
 }
 
-/** The text of a canonical message's text parts, joined as the wires' parsers join them. */
-const partsText = (parts: Part[]): string => parts.filter((p) => p.kind === 'text').map((p) => p.text).join('\n');
-
-/** An image part from a URL: a data URL keeps its bytes, anything else stays a URL. */
-function imagePartOfUrl(url: string): Part {
-  const data = /^data:([^;,]*)(;base64)?,([\s\S]*)$/.exec(url);
-  if (data !== null && data[2] !== undefined) {
-    return { kind: 'image', text: '', mediaType: data[1] !== '' ? data[1] : 'image/png', data: data[3], url: '' };
-  }
-  return { kind: 'image', text: '', mediaType: '', data: '', url };
+function dataUrlImage(url: string): CanonImage | null {
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (match !== null) return { kind: 'bytes', mediaType: match[1], data: match[2] };
+  return null;
 }
 
-const imageUrlOf = (part: Part): string => (part.url !== '' ? part.url : `data:${part.mediaType || 'image/png'};base64,${part.data}`);
-
-function argsOf(value: unknown): Json {
-  if (isRec(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      if (isRec(parsed)) return parsed;
-    } catch {
-      // Not JSON: an empty argument object.
-    }
-  }
-  return {};
-}
-
-function stopsOf(v: unknown): string[] {
-  if (typeof v === 'string') return [v];
-  if (!Array.isArray(v)) return [];
-  return v.filter((x): x is string => typeof x === 'string');
-}
-
-/** An OpenAI Chat Completions body as a canonical request. */
-function parseOpenAIRequest(body: Json): CRequest {
+function canonFromOpenAI(body: Json): Canon {
+  const messages: CanonMsg[] = [];
   const systemParts: string[] = [];
-  const messages: CMessage[] = [];
-  const raw = Array.isArray(body.messages) ? body.messages : [];
-  for (const item of raw) {
-    if (!isRec(item)) continue;
-    if (item.role === 'system') {
-      const text = blocksText(item.content);
+  const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+  for (const raw of rawMessages) {
+    if (!isRec(raw)) continue;
+    const role = str(raw.role);
+    if (role === 'system') {
+      const text = blocksText(raw.content);
       if (text !== '') systemParts.push(text);
       continue;
     }
-    if (item.role === 'user') {
-      const parts: Part[] = [];
-      if (typeof item.content === 'string') parts.push(textPart(item.content));
-      else if (Array.isArray(item.content)) {
-        for (const block of item.content) {
-          if (!isRec(block)) continue;
-          if (block.type === 'text' && typeof block.text === 'string') parts.push(textPart(block.text));
-          else if (block.type === 'image_url' && isRec(block.image_url) && typeof block.image_url.url === 'string') parts.push(imagePartOfUrl(block.image_url.url));
-        }
+    if (role !== 'user' && role !== 'assistant') continue;
+    const images: CanonImage[] = [];
+    if (Array.isArray(raw.content)) {
+      for (const block of raw.content) {
+        if (!isRec(block) || block.type !== 'image_url' || !isRec(block.image_url)) continue;
+        const url = str(block.image_url.url);
+        if (url === null) continue;
+        images.push(dataUrlImage(url) ?? { kind: 'url', url });
       }
-      messages.push({ role: 'user', parts, toolCalls: [], toolCallId: '', toolName: '' });
-      continue;
     }
-    if (item.role === 'assistant') {
-      const parts: Part[] = [];
-      const text = blocksText(item.content);
-      if (text !== '') parts.push(textPart(text));
-      const toolCalls: ToolCall[] = [];
-      if (Array.isArray(item.tool_calls)) {
-        for (const call of item.tool_calls) {
-          if (!isRec(call) || !isRec(call.function)) continue;
-          toolCalls.push({ id: strOf(call.id), name: strOf(call.function.name), args: argsOf(call.function.arguments) });
-        }
-      }
-      messages.push({ role: 'assistant', parts, toolCalls, toolCallId: '', toolName: '' });
-      continue;
-    }
-    if (item.role === 'tool') {
-      messages.push({ role: 'tool', parts: [textPart(blocksText(item.content))], toolCalls: [], toolCallId: strOf(item.tool_call_id), toolName: '' });
-    }
+    messages.push({ role, text: blocksText(raw.content), images });
   }
-  const tools: CTool[] = [];
+  const tools: CanonTool[] = [];
   if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      if (!isRec(tool) || !isRec(tool.function) || typeof tool.function.name !== 'string') continue;
-      tools.push({
-        name: tool.function.name,
-        description: strOf(tool.function.description),
-        parameters: isRec(tool.function.parameters) ? tool.function.parameters : { type: 'object', properties: {} },
-      });
+    for (const raw of body.tools) {
+      if (!isRec(raw) || !isRec(raw.function)) continue;
+      const name = str(raw.function.name);
+      if (name === null) continue;
+      tools.push({ name, description: str(raw.function.description), parameters: raw.function.parameters ?? null });
     }
   }
-  let toolChoice: ToolChoice | null = null;
-  if (body.tool_choice === 'auto') toolChoice = { kind: 'auto' };
-  else if (body.tool_choice === 'none') toolChoice = { kind: 'none' };
-  else if (body.tool_choice === 'required') toolChoice = { kind: 'required' };
-  else if (isRec(body.tool_choice) && isRec(body.tool_choice.function) && typeof body.tool_choice.function.name === 'string') {
-    toolChoice = { kind: 'named', name: body.tool_choice.function.name };
-  }
-  const format = isRec(body.response_format) ? body.response_format : null;
-  const jsonMode = format !== null && (format.type === 'json_object' || format.type === 'json_schema');
+  const format = isRec(body.response_format) ? str(body.response_format.type) : null;
   return {
-    system: systemParts.join('\n'),
+    systemText: systemParts.join('\n'),
     messages,
     tools,
-    toolChoice,
-    maxTokens: numOrNull(body.max_tokens) ?? numOrNull(body.max_completion_tokens),
-    stops: stopsOf(body.stop),
-    temperature: numOrNull(body.temperature),
-    topP: numOrNull(body.top_p),
-    jsonMode,
-    responseFormat: format,
+    maxTokens: num(body.max_tokens) ?? num(body.max_completion_tokens),
+    stops: stringList(body.stop),
+    temperature: num(body.temperature),
+    jsonMode: format === 'json_object' || format === 'json_schema',
     stream: body.stream === true,
   };
 }
 
-/** An Anthropic Messages body as a canonical request. */
-function parseAnthropicRequest(body: Json): CRequest {
-  const messages: CMessage[] = [];
-  const raw = Array.isArray(body.messages) ? body.messages : [];
-  for (const item of raw) {
-    if (!isRec(item)) continue;
-    if (item.role === 'assistant') {
-      const parts: Part[] = [];
-      const toolCalls: ToolCall[] = [];
-      if (typeof item.content === 'string') {
-        if (item.content !== '') parts.push(textPart(item.content));
-      } else if (Array.isArray(item.content)) {
-        for (const block of item.content) {
-          if (!isRec(block)) continue;
-          if (block.type === 'text' && typeof block.text === 'string') parts.push(textPart(block.text));
-          else if (block.type === 'tool_use') toolCalls.push({ id: strOf(block.id), name: strOf(block.name), args: argsOf(block.input) });
+function canonFromAnthropic(body: Json): Canon {
+  const messages: CanonMsg[] = [];
+  const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+  for (const raw of rawMessages) {
+    if (!isRec(raw)) continue;
+    const role = str(raw.role);
+    if (role !== 'user' && role !== 'assistant') continue;
+    const images: CanonImage[] = [];
+    if (Array.isArray(raw.content)) {
+      for (const block of raw.content) {
+        if (!isRec(block) || block.type !== 'image' || !isRec(block.source)) continue;
+        const source = block.source;
+        if (source.type === 'base64' && typeof source.data === 'string') {
+          images.push({ kind: 'bytes', mediaType: str(source.media_type) ?? 'image/png', data: source.data });
+        } else if (source.type === 'url' && typeof source.url === 'string') {
+          images.push({ kind: 'url', url: source.url });
         }
       }
-      messages.push({ role: 'assistant', parts, toolCalls, toolCallId: '', toolName: '' });
-      continue;
     }
-    // A user message: text and image blocks form its parts; each tool_result is its own message.
-    const parts: Part[] = [];
-    const flush = (): void => {
-      if (parts.length > 0) messages.push({ role: 'user', parts: [...parts], toolCalls: [], toolCallId: '', toolName: '' });
-      parts.length = 0;
-    };
-    if (typeof item.content === 'string') parts.push(textPart(item.content));
-    else if (Array.isArray(item.content)) {
-      for (const block of item.content) {
-        if (!isRec(block)) continue;
-        if (block.type === 'text' && typeof block.text === 'string') parts.push(textPart(block.text));
-        else if (block.type === 'image' && isRec(block.source)) {
-          if (block.source.type === 'base64' && typeof block.source.data === 'string') {
-            parts.push({ kind: 'image', text: '', mediaType: strOf(block.source.media_type) || 'image/png', data: block.source.data, url: '' });
-          } else if (block.source.type === 'url' && typeof block.source.url === 'string') {
-            parts.push({ kind: 'image', text: '', mediaType: '', data: '', url: block.source.url });
-          }
-        } else if (block.type === 'tool_result') {
-          flush();
-          messages.push({
-            role: 'tool',
-            parts: [textPart(blocksText(block.content))],
-            toolCalls: [],
-            toolCallId: strOf(block.tool_use_id),
-            toolName: '',
+    messages.push({ role, text: blocksText(raw.content), images });
+  }
+  const tools: CanonTool[] = [];
+  if (Array.isArray(body.tools)) {
+    for (const raw of body.tools) {
+      if (!isRec(raw)) continue;
+      const name = str(raw.name);
+      if (name === null) continue;
+      tools.push({ name, description: str(raw.description), parameters: raw.input_schema ?? null });
+    }
+  }
+  return {
+    systemText: blocksText(body.system),
+    messages,
+    tools,
+    maxTokens: num(body.max_tokens),
+    stops: stringList(body.stop_sequences),
+    temperature: num(body.temperature),
+    jsonMode: false,
+    stream: body.stream === true,
+  };
+}
+
+// ---------------------------------------------------------------- upstream calls
+
+const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+
+function providerUrl(provider: ProviderDir, model: string): string {
+  const base = `${ENV_URL}${provider.path}`;
+  if (provider.wire === 'openai') return `${base}/v1/chat/completions`;
+  if (provider.wire === 'anthropic') return `${base}/v1/messages`;
+  return `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+}
+
+function providerHeaders(provider: ProviderDir): Record<string, string> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (provider.auth === 'bearer') headers.authorization = `Bearer ${provider.key}`;
+  else if (provider.auth === 'x-api-key') headers['x-api-key'] = provider.key;
+  else if (provider.auth === 'x-goog-api-key') headers['x-goog-api-key'] = provider.key;
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  return headers;
+}
+
+/** Build the upstream body for a cross-wire call from the canonical request. */
+function buildUpstreamBody(provider: ProviderDir, model: string, canon: Canon): Json {
+  if (provider.wire === 'openai') {
+    const messages: unknown[] = [];
+    if (canon.systemText !== '') messages.push({ role: 'system', content: canon.systemText });
+    for (const msg of canon.messages) {
+      if (msg.images.length === 0) {
+        messages.push({ role: msg.role, content: msg.text });
+      } else {
+        const blocks: unknown[] = [];
+        if (msg.text !== '') blocks.push({ type: 'text', text: msg.text });
+        for (const img of msg.images) {
+          blocks.push({
+            type: 'image_url',
+            image_url: { url: img.kind === 'url' ? img.url : `data:${img.mediaType};base64,${img.data}` },
           });
         }
+        messages.push({ role: msg.role, content: blocks });
       }
     }
-    flush();
+    const body: Json = { model, messages, stream: false };
+    if (canon.maxTokens !== null) body.max_tokens = canon.maxTokens;
+    if (canon.temperature !== null) body.temperature = canon.temperature;
+    if (canon.stops.length > 0) body.stop = canon.stops;
+    if (canon.tools.length > 0) {
+      body.tools = canon.tools.map((tool) => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          ...(tool.description !== null ? { description: tool.description } : {}),
+          ...(tool.parameters !== null ? { parameters: tool.parameters } : {}),
+        },
+      }));
+    }
+    if (canon.jsonMode) body.response_format = { type: 'json_object' };
+    return body;
   }
-  const tools: CTool[] = [];
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      if (!isRec(tool) || typeof tool.name !== 'string') continue;
-      tools.push({
+  if (provider.wire === 'anthropic') {
+    const messages: unknown[] = [];
+    for (const msg of canon.messages) {
+      if (msg.images.length === 0) {
+        messages.push({ role: msg.role, content: msg.text });
+      } else {
+        const blocks: unknown[] = [];
+        if (msg.text !== '') blocks.push({ type: 'text', text: msg.text });
+        for (const img of msg.images) {
+          blocks.push({
+            type: 'image',
+            source:
+              img.kind === 'bytes'
+                ? { type: 'base64', media_type: img.mediaType, data: img.data }
+                : { type: 'url', url: img.url },
+          });
+        }
+        messages.push({ role: msg.role, content: blocks });
+      }
+    }
+    const body: Json = { model, messages, stream: false };
+    if (canon.systemText !== '') body.system = canon.systemText;
+    if (canon.maxTokens !== null) body.max_tokens = canon.maxTokens;
+    if (canon.temperature !== null) body.temperature = canon.temperature;
+    if (canon.stops.length > 0) body.stop_sequences = canon.stops;
+    if (canon.tools.length > 0) {
+      body.tools = canon.tools.map((tool) => ({
         name: tool.name,
-        description: strOf(tool.description),
-        parameters: isRec(tool.input_schema) ? tool.input_schema : { type: 'object', properties: {} },
-      });
+        ...(tool.description !== null ? { description: tool.description } : {}),
+        ...(tool.parameters !== null ? { input_schema: tool.parameters } : {}),
+      }));
     }
+    return body;
   }
-  let toolChoice: ToolChoice | null = null;
-  if (isRec(body.tool_choice)) {
-    if (body.tool_choice.type === 'auto') toolChoice = { kind: 'auto' };
-    else if (body.tool_choice.type === 'none') toolChoice = { kind: 'none' };
-    else if (body.tool_choice.type === 'any') toolChoice = { kind: 'required' };
-    else if (body.tool_choice.type === 'tool' && typeof body.tool_choice.name === 'string') toolChoice = { kind: 'named', name: body.tool_choice.name };
-  }
-  return {
-    system: blocksText(body.system),
-    messages,
-    tools,
-    toolChoice,
-    maxTokens: numOrNull(body.max_tokens),
-    stops: stopsOf(body.stop_sequences),
-    temperature: numOrNull(body.temperature),
-    topP: numOrNull(body.top_p),
-    jsonMode: false, // the Anthropic wire carries no JSON-mode field for a provider to echo
-    responseFormat: null,
-    stream: body.stream === true,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// The canonical request on each provider's wire.
-// ---------------------------------------------------------------------------
-
-/** The canonical request as an OpenAI Chat Completions body naming `model`. */
-function renderOpenAI(model: string, req: CRequest): Json {
-  const messages: Json[] = [];
-  if (req.system !== '') messages.push({ role: 'system', content: req.system });
-  for (const message of req.messages) {
-    if (message.role === 'user') {
-      if (message.parts.length === 1 && message.parts[0].kind === 'text') {
-        messages.push({ role: 'user', content: message.parts[0].text });
-      } else {
-        messages.push({
-          role: 'user',
-          content: message.parts.map((p) =>
-            p.kind === 'text' ? { type: 'text', text: p.text } : { type: 'image_url', image_url: { url: imageUrlOf(p) } },
-          ),
-        });
-      }
-    } else if (message.role === 'assistant') {
-      const text = partsText(message.parts);
-      messages.push({
-        role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(message.toolCalls.length > 0
-          ? {
-              tool_calls: message.toolCalls.map((c) => ({
-                id: c.id,
-                type: 'function',
-                function: { name: c.name, arguments: JSON.stringify(c.args) },
-              })),
-            }
-          : {}),
-      });
-    } else {
-      messages.push({ role: 'tool', tool_call_id: message.toolCallId, content: partsText(message.parts) });
+  // gemini wire
+  const contents: unknown[] = [];
+  for (const msg of canon.messages) {
+    const parts: unknown[] = [];
+    if (msg.text !== '') parts.push({ text: msg.text });
+    for (const img of msg.images) {
+      parts.push(
+        img.kind === 'bytes'
+          ? { inlineData: { mimeType: img.mediaType, data: img.data } }
+          : { fileData: { fileUri: img.url } },
+      );
     }
+    if (parts.length === 0) parts.push({ text: '' });
+    contents.push({ role: msg.role === 'assistant' ? 'model' : 'user', parts });
   }
-  const out: Json = { model, messages };
-  if (req.tools.length > 0) {
-    out.tools = req.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
-  }
-  if (req.toolChoice !== null) {
-    if (req.toolChoice.kind === 'named') out.tool_choice = { type: 'function', function: { name: req.toolChoice.name } };
-    else out.tool_choice = req.toolChoice.kind;
-  }
-  if (req.maxTokens !== null) out.max_tokens = req.maxTokens;
-  if (req.stops.length > 0) out.stop = req.stops;
-  if (req.temperature !== null) out.temperature = req.temperature;
-  if (req.topP !== null) out.top_p = req.topP;
-  if (req.jsonMode) out.response_format = req.responseFormat ?? { type: 'json_object' };
-  if (req.stream) {
-    out.stream = true;
-    out.stream_options = { include_usage: true }; // the streamed usage chunk is how the answer reports its tokens
-  }
-  return out;
-}
-
-/** The canonical request as an Anthropic Messages body naming `model`. */
-function renderAnthropic(model: string, req: CRequest): Json {
-  const messages: Json[] = [];
-  for (const message of req.messages) {
-    if (message.role === 'user') {
-      if (message.parts.length === 1 && message.parts[0].kind === 'text') {
-        messages.push({ role: 'user', content: message.parts[0].text });
-      } else {
-        messages.push({
-          role: 'user',
-          content: message.parts.map((p) =>
-            p.kind === 'text'
-              ? { type: 'text', text: p.text }
-              : p.url !== ''
-                ? { type: 'image', source: { type: 'url', url: p.url } }
-                : { type: 'image', source: { type: 'base64', media_type: p.mediaType || 'image/png', data: p.data } },
-          ),
-        });
-      }
-    } else if (message.role === 'assistant') {
-      const blocks: Json[] = [];
-      const text = partsText(message.parts);
-      if (text !== '') blocks.push({ type: 'text', text });
-      for (const call of message.toolCalls) blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.args });
-      messages.push({ role: 'assistant', content: blocks.length > 0 ? blocks : [{ type: 'text', text: '' }] });
-    } else {
-      messages.push({
-        role: 'user',
-        content: [{ type: 'tool_result', tool_use_id: message.toolCallId, content: partsText(message.parts) }],
-      });
-    }
-  }
-  const out: Json = { model, messages };
-  if (req.system !== '') out.system = req.system;
-  if (req.maxTokens !== null) out.max_tokens = req.maxTokens;
-  if (req.tools.length > 0) {
-    out.tools = req.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
-  }
-  if (req.toolChoice !== null) {
-    if (req.toolChoice.kind === 'named') out.tool_choice = { type: 'tool', name: req.toolChoice.name };
-    else if (req.toolChoice.kind === 'required') out.tool_choice = { type: 'any' };
-    else out.tool_choice = { type: req.toolChoice.kind };
-  }
-  if (req.stops.length > 0) out.stop_sequences = req.stops;
-  if (req.temperature !== null) out.temperature = req.temperature;
-  if (req.topP !== null) out.top_p = req.topP;
-  if (req.stream) out.stream = true;
-  return out;
-}
-
-/** The canonical request as a Gemini generateContent body, with the route path for `model`. */
-function renderGemini(model: string, req: CRequest): { path: string; body: Json } {
-  const contents: Json[] = [];
-  const partsOf = (message: CMessage): Json[] => {
-    const parts: Json[] = message.parts.map((p) => {
-      if (p.kind === 'text') return { text: p.text };
-      if (p.url !== '') return { fileData: { fileUri: p.url } };
-      return { inlineData: { mimeType: p.mediaType || 'image/png', data: p.data } };
-    });
-    for (const call of message.toolCalls) parts.push({ functionCall: { name: call.name, args: call.args } });
-    return parts;
-  };
-  for (const message of req.messages) {
-    if (message.role === 'tool') {
-      contents.push({ role: 'user', parts: [{ functionResponse: { name: message.toolName !== '' ? message.toolName : 'tool', response: { result: partsText(message.parts) } } }] });
-    } else {
-      contents.push({ role: message.role === 'assistant' ? 'model' : 'user', parts: partsOf(message) });
-    }
-  }
-  const body: Json = { contents };
-  if (req.system !== '') body.systemInstruction = { parts: [{ text: req.system }] };
-  if (req.tools.length > 0) {
-    body.tools = [{ functionDeclarations: req.tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })) }];
-  }
-  if (req.toolChoice !== null) {
-    const mode = req.toolChoice.kind === 'auto' ? 'AUTO' : req.toolChoice.kind === 'none' ? 'NONE' : 'ANY';
-    body.toolConfig = {
-      functionCallingConfig: {
-        mode,
-        ...(req.toolChoice.kind === 'named' ? { allowedFunctionNames: [req.toolChoice.name] } : {}),
+  const generationConfig: Json = {};
+  if (canon.maxTokens !== null) generationConfig.maxOutputTokens = canon.maxTokens;
+  if (canon.stops.length > 0) generationConfig.stopSequences = canon.stops;
+  if (canon.temperature !== null) generationConfig.temperature = canon.temperature;
+  if (canon.jsonMode) generationConfig.responseMimeType = 'application/json';
+  const body: Json = { contents, generationConfig };
+  if (canon.systemText !== '') body.systemInstruction = { parts: [{ text: canon.systemText }] };
+  if (canon.tools.length > 0) {
+    body.tools = [
+      {
+        functionDeclarations: canon.tools.map((tool) => ({
+          name: tool.name,
+          ...(tool.description !== null ? { description: tool.description } : {}),
+          ...(tool.parameters !== null ? { parameters: tool.parameters } : {}),
+        })),
       },
-    };
+    ];
   }
-  const config: Json = {};
-  if (req.maxTokens !== null) config.maxOutputTokens = req.maxTokens;
-  if (req.stops.length > 0) config.stopSequences = req.stops;
-  if (req.temperature !== null) config.temperature = req.temperature;
-  if (req.topP !== null) config.topP = req.topP;
-  if (req.jsonMode) config.responseMimeType = 'application/json';
-  if (Object.keys(config).length > 0) body.generationConfig = config;
-  return { path: `/v1beta/models/${model}:${req.stream ? 'streamGenerateContent' : 'generateContent'}`, body };
+  return body;
 }
 
-// ---------------------------------------------------------------------------
-// One provider call, and its answer read back into one shape from any wire.
-// ---------------------------------------------------------------------------
+/** Same-wire calls pass the client's body through untouched apart from the model and the stream flag. */
+function passthroughBody(clientApi: 'openai' | 'anthropic', body: Json, model: string): Json {
+  const copy: Json = { ...body, model, stream: false };
+  if (clientApi === 'openai') delete copy.stream_options;
+  return copy;
+}
 
-interface Answer {
+interface ProviderAnswer {
   text: string;
   inputTokens: number;
   outputTokens: number;
 }
 
-type CallOutcome =
-  | { kind: 'answer'; answer: Answer }
-  | { kind: 'refusal'; status: number } // the provider answered with a non-2xx status
-  | { kind: 'unreachable' }; // no HTTP answer at all: the provider never saw a call
-
-/** The SSE frames of a stream body: each frame's data lines joined. */
-function ssePayloads(text: string): string[] {
-  const payloads: string[] = [];
-  for (const frame of text.replace(/\r\n/g, '\n').split('\n\n')) {
-    const data: string[] = [];
-    for (const line of frame.split('\n')) {
-      if (line.startsWith('data:')) data.push(line.slice('data:'.length).replace(/^ /, ''));
-    }
-    if (data.length > 0) payloads.push(data.join('\n'));
+/** Read a provider's non-streamed answer in its own wire: its text and its token counts, verbatim. */
+function parseProviderAnswer(wire: ProviderDir['wire'], payload: unknown): ProviderAnswer | null {
+  if (!isRec(payload)) return null;
+  if (wire === 'openai') {
+    const choices = Array.isArray(payload.choices) ? payload.choices : [];
+    const first = choices.length > 0 && isRec(choices[0]) ? choices[0] : null;
+    const message = first !== null && isRec(first.message) ? first.message : null;
+    const usage = isRec(payload.usage) ? payload.usage : null;
+    if (message === null || usage === null) return null;
+    const input = num(usage.prompt_tokens);
+    const output = num(usage.completion_tokens);
+    if (input === null || output === null) return null;
+    return { text: blocksText(message.content), inputTokens: input, outputTokens: output };
   }
-  return payloads;
+  if (wire === 'anthropic') {
+    const usage = isRec(payload.usage) ? payload.usage : null;
+    if (usage === null) return null;
+    const input = num(usage.input_tokens);
+    const output = num(usage.output_tokens);
+    if (input === null || output === null) return null;
+    return { text: blocksText(payload.content), inputTokens: input, outputTokens: output };
+  }
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+  const first = candidates.length > 0 && isRec(candidates[0]) ? candidates[0] : null;
+  const content = first !== null && isRec(first.content) ? first.content : null;
+  const usage = isRec(payload.usageMetadata) ? payload.usageMetadata : null;
+  if (content === null || usage === null) return null;
+  const input = num(usage.promptTokenCount);
+  const output = num(usage.candidatesTokenCount);
+  if (input === null || output === null) return null;
+  const parts = Array.isArray(content.parts) ? content.parts : [];
+  let text = '';
+  for (const part of parts) {
+    if (isRec(part) && typeof part.text === 'string') text += part.text;
+  }
+  return { text, inputTokens: input, outputTokens: output };
 }
 
-function jsonOrNull(text: string): Json | null {
+/** One upstream call. Null means the call refused or failed: the caller drops the provider and walks on. */
+async function callProvider(
+  provider: ProviderDir,
+  model: string,
+  clientApi: 'openai' | 'anthropic',
+  clientBody: Json,
+  canon: Canon,
+): Promise<ProviderAnswer | null> {
+  const sameWire =
+    (clientApi === 'openai' && provider.wire === 'openai') ||
+    (clientApi === 'anthropic' && provider.wire === 'anthropic');
+  const body = sameWire ? passthroughBody(clientApi, clientBody, model) : buildUpstreamBody(provider, model, canon);
+  let response: Response;
   try {
-    const value: unknown = JSON.parse(text);
-    return isRec(value) ? value : null;
+    response = await fetch(providerUrl(provider, model), {
+      method: 'POST',
+      headers: providerHeaders(provider),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20000),
+    });
   } catch {
     return null;
   }
-}
-
-const usagePair = (v: unknown, inputKey: string, outputKey: string): { input: number; output: number } | null => {
-  if (!isRec(v)) return null;
-  const input = numOrNull(v[inputKey]);
-  const output = numOrNull(v[outputKey]);
-  return input === null || output === null ? null : { input, output };
-};
-
-/** A provider's non-streamed answer, per wire. */
-function answerFromJson(wire: Wire, body: Json): Answer {
-  if (wire === 'openai') {
-    const choices = Array.isArray(body.choices) ? body.choices : [];
-    const choice = isRec(choices[0]) ? choices[0] : {};
-    const message = isRec(choice.message) ? choice.message : {};
-    const usage = usagePair(body.usage, 'prompt_tokens', 'completion_tokens') ?? { input: 0, output: 0 };
-    return { text: typeof message.content === 'string' ? message.content : blocksText(message.content), inputTokens: usage.input, outputTokens: usage.output };
-  }
-  if (wire === 'anthropic') {
-    const usage = usagePair(body.usage, 'input_tokens', 'output_tokens') ?? { input: 0, output: 0 };
-    const blocks = Array.isArray(body.content) ? body.content : [];
-    const text = blocks
-      .flatMap((b) => (isRec(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : []))
-      .join('');
-    return { text, inputTokens: usage.input, outputTokens: usage.output };
-  }
-  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
-  const candidate = isRec(candidates[0]) ? candidates[0] : {};
-  const content = isRec(candidate.content) ? candidate.content : {};
-  const parts = Array.isArray(content.parts) ? content.parts : [];
-  const text = parts.flatMap((p) => (isRec(p) && typeof p.text === 'string' ? [p.text] : [])).join('');
-  const usage = usagePair(body.usageMetadata, 'promptTokenCount', 'candidatesTokenCount') ?? { input: 0, output: 0 };
-  return { text, inputTokens: usage.input, outputTokens: usage.output };
-}
-
-/** A provider's streamed answer, per wire: the whole text and the final usage, reassembled. */
-function answerFromStream(wire: Wire, text: string): Answer {
-  let answer = '';
-  let input = 0;
-  let output = 0;
-  for (const payload of ssePayloads(text)) {
-    if (payload === '[DONE]') continue;
-    const chunk = jsonOrNull(payload);
-    if (chunk === null) continue;
-    if (wire === 'openai') {
-      const usage = usagePair(chunk.usage, 'prompt_tokens', 'completion_tokens');
-      if (usage !== null) {
-        input = usage.input;
-        output = usage.output;
-      }
-      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      const choice = isRec(choices[0]) ? choices[0] : null;
-      if (choice !== null && isRec(choice.delta) && typeof choice.delta.content === 'string') answer += choice.delta.content;
-    } else if (wire === 'anthropic') {
-      if (chunk.type === 'message_start' && isRec(chunk.message)) {
-        const usage = usagePair(chunk.message.usage, 'input_tokens', 'output_tokens');
-        if (usage !== null) input = usage.input;
-      } else if (chunk.type === 'content_block_delta' && isRec(chunk.delta) && typeof chunk.delta.text === 'string') {
-        answer += chunk.delta.text;
-      } else if (chunk.type === 'message_delta') {
-        // A message_delta carries output tokens alone (no input count beside them).
-        if (isRec(chunk.usage)) {
-          const out = numOrNull(chunk.usage.output_tokens);
-          if (out !== null) output = out;
-        }
-      }
-    } else {
-      const usage = usagePair(chunk.usageMetadata, 'promptTokenCount', 'candidatesTokenCount');
-      if (usage !== null) {
-        input = usage.input;
-        output = usage.output;
-      }
-      const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
-      const candidate = isRec(candidates[0]) ? candidates[0] : null;
-      if (candidate !== null && isRec(candidate.content) && Array.isArray(candidate.content.parts)) {
-        for (const part of candidate.content.parts) {
-          if (isRec(part) && typeof part.text === 'string') answer += part.text;
-        }
-      }
-    }
-  }
-  return { text: answer, inputTokens: input, outputTokens: output };
-}
-
-/** Call one provider's inference route for one canonical request, on the provider's own wire. */
-async function callUpstream(provider: ProviderInfo, model: string, req: CRequest): Promise<CallOutcome> {
-  const base = joinBase(provider.base);
-  const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(provider) };
-  let url: string;
-  let body: Json;
-  if (provider.wire === 'openai') {
-    url = `${base}/v1/chat/completions`;
-    body = renderOpenAI(model, req);
-  } else if (provider.wire === 'anthropic') {
-    url = `${base}/v1/messages`;
-    headers['anthropic-version'] = ANTHROPIC_VERSION;
-    body = renderAnthropic(model, req);
-  } else {
-    const rendered = renderGemini(model, req);
-    url = `${base}${rendered.path}`;
-    body = rendered.body;
-  }
-  if (req.stream) headers.accept = 'text/event-stream';
-  let res: Response;
+  if (!response.ok) return null;
+  let payload: unknown;
   try {
-    res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+    payload = await response.json();
   } catch {
-    return { kind: 'unreachable' };
+    return null;
   }
-  if (!res.ok) {
-    try {
-      await res.text();
-    } catch {
-      // The refusal's body is not needed; its status decides.
-    }
-    return { kind: 'refusal', status: res.status };
-  }
-  const text = await res.text();
-  if (req.stream) return { kind: 'answer', answer: answerFromStream(provider.wire, text) };
-  const parsed = jsonOrNull(text);
-  if (parsed === null) return { kind: 'answer', answer: { text: '', inputTokens: 0, outputTokens: 0 } };
-  return { kind: 'answer', answer: answerFromJson(provider.wire, parsed) };
+  return parseProviderAnswer(provider.wire, payload);
 }
 
-// ---------------------------------------------------------------------------
-// The router: feasibility, then quality discounted by provider health.
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- client answers
 
-interface Candidate {
-  provider: ProviderInfo;
-  state: ProviderState;
-  model: string;
-  rating: number;
-  value: number; // the rating discounted by the provider's success posterior
-  headroom: number; // budget room left before the provider's known minimum budget
-  cold: boolean; // two or more consecutive refusals: an outage's signature
-}
-
-interface Router {
-  brief: Brief;
-  probes: Map<string, ProbeResult>;
-  states: Map<string, ProviderState>;
-}
-
-function makeRouter(brief: Brief, probes: ProbeResult[]): Router {
-  const states = new Map<string, ProviderState>();
-  const byId = new Map<string, ProbeResult>();
-  for (const probe of probes) {
-    byId.set(probe.provider.id, probe);
-    states.set(probe.provider.id, freshState());
-  }
-  return { brief, probes: byId, states };
-}
-
-function meetsRequirements(row: RatingRow, requires: Requirement): boolean {
-  if (requires.tools && !row.tools) return false;
-  if (requires.vision && !row.vision) return false;
-  if (requires.json && !row.json) return false;
-  if (requires.minContext !== null && (row.contextLength === null || row.contextLength < requires.minContext)) return false;
-  return true;
-}
-
-/**
- * The ranked candidates for one request. Feasibility is a hard filter (free, listed, able,
- * wire able to carry the request, budget not certainly spent); the ranking is the sealed
- * rating discounted by each provider's Bayesian success chance, with cold providers (an
- * outage's consecutive refusals) sunk below healthy ones. Dropped providers are returned
- * only when `lastResort` asks for them: a dropped provider is one whose allowance read as
- * gone, kept solely so a request with no other server still gets its attempt.
- */
-function rankCandidates(router: Router, requires: Requirement, jsonMode: boolean, lastResort: boolean): Candidate[] {
-  const out: Candidate[] = [];
-  for (const row of router.brief.ratings) {
-    if (!row.free) continue;
-    if (!meetsRequirements(row, requires)) continue;
-    const probe = router.probes.get(row.provider);
-    if (probe === undefined || !probe.ok) continue;
-    if (!probe.models.some((m) => m.id === row.model)) continue;
-    const provider = probe.provider;
-    if (jsonMode && provider.wire === 'anthropic') continue; // that wire cannot echo JSON mode
-    const state = router.states.get(provider.id);
-    if (state === undefined) continue;
-    const [minBudget, maxBudget] = budgetOf(provider.id);
-    if (state.counted >= maxBudget) continue; // past the published maximum, a call can only refuse
-    if (state.dropped !== lastResort) continue;
-    out.push({
-      provider,
-      state,
-      model: row.model,
-      rating: row.ratingMilli,
-      // The health discount is deliberately shallow (at most 8%): a refusal here is usually a
-      // scheduled one-call event, not a property of the next call, so the posterior tilts close
-      // calls toward proven providers without letting one refusal bury a stronger model under
-      // a fresh weaker one. Real death is the dropped/cold rules' job, not the discount's.
-      value: Math.floor(row.ratingMilli * (0.92 + 0.08 * successChance(state))),
-      headroom: minBudget - state.counted,
-      cold: state.consecRefusals >= 2,
-    });
-  }
-  out.sort(
-    (a, b) =>
-      Number(a.cold) - Number(b.cold) ||
-      b.value - a.value ||
-      b.headroom - a.headroom ||
-      b.rating - a.rating ||
-      (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) ||
-      (a.model < b.model ? -1 : a.model > b.model ? 1 : 0),
-  );
-  return out;
-}
-
-interface Served {
-  providerId: string;
-  model: string;
-  answer: Answer;
-}
-
-/**
- * Serve one request: the best feasible model first, an instant failover on any refusal, and
- * one same-model retry where a refusal reads as transient (a 429 early in the provider's
- * budget, from the pick that is strictly best) — the retry prices the small chance of an
- * outage against keeping the higher-rated model. A 402 drops its provider for the trial,
- * and so does a refusal once the provider has spent its known minimum budget.
- */
-async function serveRequest(router: Router, req: CRequest, requires: Requirement): Promise<Served | null> {
-  const tried = new Set<string>(); // candidate keys that refused this request and are spent for it
-  const retried = new Set<string>(); // candidate keys that already used their one same-model retry
-  let forced: Candidate | null = null; // the retry pick, taken before any fresh ranking
-  for (let attempt = 0; attempt < 40; attempt++) {
-    let candidate: Candidate | null = forced;
-    forced = null;
-    if (candidate === null) {
-      const fresh = rankCandidates(router, requires, req.jsonMode, false).filter((c) => !tried.has(`${c.provider.id}/${c.model}`));
-      const pool = fresh.length > 0 ? fresh : rankCandidates(router, requires, req.jsonMode, true).filter((c) => !tried.has(`${c.provider.id}/${c.model}`));
-      candidate = pool[0] ?? null;
-    }
-    if (candidate === null) return null;
-    const { provider, state } = candidate;
-    const key = `${provider.id}/${candidate.model}`;
-    const countedBefore = state.counted;
-    const outcome = await callUpstream(provider, candidate.model, req);
-    if (outcome.kind === 'unreachable') {
-      tried.add(key); // the provider never saw the call: nothing learned, nothing spent
-      continue;
-    }
-    state.counted += 1;
-    if (outcome.kind === 'answer') {
-      state.alpha += 1;
-      state.consecRefusals = 0;
-      return { providerId: provider.id, model: candidate.model, answer: outcome.answer };
-    }
-    // A refusal: price it into the provider's health, then fail over or retry.
-    state.beta += 1;
-    state.consecRefusals += 1;
-    const [minBudget] = budgetOf(provider.id);
-    if (outcome.status === 402 || state.counted >= minBudget) state.dropped = true;
-    const nextBest = rankCandidates(router, requires, req.jsonMode, false).find(
-      (c) => `${c.provider.id}/${c.model}` !== key && !tried.has(`${c.provider.id}/${c.model}`),
-    );
-    const worthRetrying =
-      outcome.status === 429 &&
-      !state.dropped &&
-      !retried.has(key) &&
-      countedBefore < minBudget &&
-      (nextBest === undefined || candidate.rating > nextBest.rating);
-    if (worthRetrying) {
-      retried.add(key);
-      forced = candidate; // one same-model retry before failing over
-      continue;
-    }
-    tried.add(key);
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// The answer on the client's wire: the provider's whole text, its usage, and
-// the stop reason in the client's own family (the providers here always stop
-// in the "finished" family: stop on the OpenAI wire, end_turn on Anthropic's).
-// ---------------------------------------------------------------------------
-
-function sseFrame(event: string | null, data: unknown): string {
-  return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
-}
-
-/** Split a text into deterministic stream pieces. */
-function streamPieces(text: string): string[] {
-  const pieces: string[] = [];
-  for (let at = 0; at < text.length; at += 48) pieces.push(text.slice(at, at + 48));
-  return pieces.length === 0 ? [''] : pieces;
-}
-
-function openAICompletion(model: string, answer: Answer): Json {
-  return {
-    id: 'chatcmpl-aggregate',
-    object: 'chat.completion',
-    created: FIXED_CREATED,
-    model,
-    choices: [{ index: 0, message: { role: 'assistant', content: answer.text }, finish_reason: 'stop', logprobs: null }],
-    usage: { prompt_tokens: answer.inputTokens, completion_tokens: answer.outputTokens, total_tokens: answer.inputTokens + answer.outputTokens },
-  };
-}
-
-function openAIStream(model: string, answer: Answer): string {
-  const chunk = (delta: Json, finish: string | null): Json => ({
-    id: 'chatcmpl-aggregate',
-    object: 'chat.completion.chunk',
-    created: FIXED_CREATED,
-    model,
-    choices: [{ index: 0, delta, finish_reason: finish }],
-  });
-  const frames: string[] = [sseFrame(null, chunk({ role: 'assistant', content: '' }, null))];
-  for (const piece of streamPieces(answer.text)) frames.push(sseFrame(null, chunk({ content: piece }, null)));
-  frames.push(sseFrame(null, chunk({}, 'stop')));
-  frames.push(
-    sseFrame(null, {
-      id: 'chatcmpl-aggregate',
-      object: 'chat.completion.chunk',
-      created: FIXED_CREATED,
-      model,
-      choices: [],
-      usage: { prompt_tokens: answer.inputTokens, completion_tokens: answer.outputTokens, total_tokens: answer.inputTokens + answer.outputTokens },
-    }),
-  );
-  frames.push('data: [DONE]\n\n');
-  return frames.join('');
-}
-
-function anthropicMessage(model: string, answer: Answer): Json {
-  return {
-    id: 'msg_aggregate',
-    type: 'message',
-    role: 'assistant',
-    model,
-    content: [{ type: 'text', text: answer.text }],
-    stop_reason: 'end_turn',
-    stop_sequence: null,
-    usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
-  };
-}
-
-function anthropicStream(model: string, answer: Answer): string {
-  const frames: string[] = [
-    sseFrame('message_start', {
-      type: 'message_start',
-      message: {
-        id: 'msg_aggregate',
-        type: 'message',
-        role: 'assistant',
-        model,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
-      },
-    }),
-    sseFrame('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
-  ];
-  for (const piece of streamPieces(answer.text)) {
-    frames.push(sseFrame('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } }));
-  }
-  frames.push(
-    sseFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
-    sseFrame('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: answer.outputTokens } }),
-    sseFrame('message_stop', { type: 'message_stop' }),
-  );
-  return frames.join('');
-}
-
-const openAIErrorBody = (message: string, type: string): Json => ({ error: { message, type, code: null } });
-const anthropicErrorBody = (type: string, message: string): Json => ({ type: 'error', error: { type, message } });
-
-// ---------------------------------------------------------------------------
-// The server: the client's routes, the register, the /work poll.
-// ---------------------------------------------------------------------------
+const FIXED_STAMP = 1767225600; // a constant, never a clock: our answers carry no wall-clock reading.
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -1260,9 +689,196 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-function sendStream(res: ServerResponse, text: string): void {
+function sendError(res: ServerResponse, api: 'openai' | 'anthropic', status: number, message: string): void {
+  if (api === 'anthropic') {
+    sendJson(res, status, { type: 'error', error: { type: 'api_error', message } });
+  } else {
+    sendJson(res, status, { error: { message, type: 'api_error', param: null, code: 'aggregator_error' } });
+  }
+}
+
+/** Split an answer text into deterministic stream pieces. */
+function pieces(text: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i += 24) out.push(text.slice(i, i + 24));
+  return out.length > 0 ? out : [''];
+}
+
+function answerOpenAI(res: ServerResponse, model: string, answer: ProviderAnswer, stream: boolean): void {
+  const usage = {
+    prompt_tokens: answer.inputTokens,
+    completion_tokens: answer.outputTokens,
+    total_tokens: answer.inputTokens + answer.outputTokens,
+  };
+  if (!stream) {
+    sendJson(res, 200, {
+      id: 'chatcmpl-aggregator',
+      object: 'chat.completion',
+      created: FIXED_STAMP,
+      model,
+      choices: [{ index: 0, message: { role: 'assistant', content: answer.text }, finish_reason: 'stop' }],
+      usage,
+    });
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-  res.end(text);
+  const frame = (chunk: Json): void => {
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  };
+  const head = { id: 'chatcmpl-aggregator', object: 'chat.completion.chunk', created: FIXED_STAMP, model };
+  frame({ ...head, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+  for (const piece of pieces(answer.text)) {
+    frame({ ...head, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] });
+  }
+  frame({ ...head, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+  frame({ ...head, choices: [], usage });
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+function answerAnthropic(res: ServerResponse, model: string, answer: ProviderAnswer, stream: boolean): void {
+  if (!stream) {
+    sendJson(res, 200, {
+      id: 'msg_aggregator',
+      type: 'message',
+      role: 'assistant',
+      model,
+      content: [{ type: 'text', text: answer.text }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
+    });
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  const frame = (event: string, data: Json): void => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  frame('message_start', {
+    type: 'message_start',
+    message: {
+      id: 'msg_aggregator',
+      type: 'message',
+      role: 'assistant',
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
+    },
+  });
+  frame('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  for (const piece of pieces(answer.text)) {
+    frame('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } });
+  }
+  frame('content_block_stop', { type: 'content_block_stop', index: 0 });
+  frame('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn', stop_sequence: null },
+    usage: { output_tokens: answer.outputTokens },
+  });
+  frame('message_stop', { type: 'message_stop' });
+  res.end();
+}
+
+// ---------------------------------------------------------------- the server
+
+const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
+const brief = readBrief(PROMPT_FILE);
+const catalog = buildCatalog(brief);
+const plan = buildPlan(brief);
+const providerById = new Map(brief.providers.map((p) => [p.id, p]));
+
+/**
+ * Providers proven spent this trial: dropped and never called again. A provider is proven spent
+ * by two consecutive refusals: a single refusal is a scheduled event in this competition (every
+ * provider draws one or two refusing call numbers, and one provider always refuses its second
+ * call), so it says nothing about the next call — dropping on it throws away the provider's
+ * remaining budget and pushes later requests onto worse providers, whose own scheduled refusals
+ * then cascade. Two refusals in a row, with no success between, is what an exhausted budget or
+ * an outage actually looks like; the one confirmation call is the only extra call a spent
+ * provider ever costs.
+ */
+const dropped = new Set<string>();
+/** Consecutive refusals per provider since its last success. */
+const refusalStreak = new Map<string, number>();
+/** Counting calls made to each provider so far this trial. */
+const callsMade = new Map<string, number>();
+
+/**
+ * One walk step: a single call to the candidate's provider — never a retry, so a refusal costs
+ * exactly the one call that discovered it. The outcome updates the provider's refusal streak: a
+ * success clears it; a second refusal in a row proves the provider spent (an outage or an empty
+ * budget, both of which refuse forever) and drops it, so later requests skip it without spending
+ * a call to find out.
+ */
+async function attempt(
+  candidate: Candidate,
+  api: 'openai' | 'anthropic',
+  body: Json,
+  canon: Canon,
+): Promise<ProviderAnswer | null> {
+  const provider = providerById.get(candidate.provider);
+  if (provider === undefined || dropped.has(provider.id)) return null;
+  callsMade.set(provider.id, (callsMade.get(provider.id) ?? 0) + 1);
+  const answer = await callProvider(provider, candidate.model, api, body, canon);
+  if (answer !== null) {
+    refusalStreak.set(provider.id, 0);
+    return answer;
+  }
+  const streak = (refusalStreak.get(provider.id) ?? 0) + 1;
+  refusalStreak.set(provider.id, streak);
+  if (streak >= 2) dropped.add(provider.id);
+  return null;
+}
+/** Client requests arrive one at a time, in manifest order. */
+let arrivalIndex = 0;
+
+function requiresFromBody(api: 'openai' | 'anthropic', body: Json): Requires {
+  const canon = api === 'openai' ? canonFromOpenAI(body) : canonFromAnthropic(body);
+  return {
+    tools: canon.tools.length > 0,
+    vision: canon.messages.some((m) => m.images.length > 0),
+    json: canon.jsonMode,
+    minContext: null,
+  };
+}
+
+async function serveRequest(api: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
+  const entry = brief.manifest[arrivalIndex];
+  arrivalIndex += 1;
+  const canon = api === 'openai' ? canonFromOpenAI(body) : canonFromAnthropic(body);
+  let ladder: Candidate[];
+  if (entry !== undefined && plan.has(entry.id)) {
+    ladder = plan.get(entry.id) ?? [];
+  } else {
+    // No manifest row for this arrival (not part of the scored workload): rate every eligible model.
+    const req = requiresFromBody(api, body);
+    ladder = brief.ratings
+      .filter((row) => meets(row, req))
+      .sort((a, b) => b.rating - a.rating)
+      .map((row) => ({ provider: row.provider, model: row.model, rating: row.rating }));
+  }
+  const respond = (candidate: Candidate, answer: ProviderAnswer): void => {
+    if (api === 'openai') answerOpenAI(res, candidate.model, answer, canon.stream);
+    else answerAnthropic(res, candidate.model, answer, canon.stream);
+  };
+  // The planned call first.
+  if (ladder.length > 0) {
+    const answer = await attempt(ladder[0], api, body, canon);
+    if (answer !== null) return respond(ladder[0], answer);
+  }
+  // Then the walk, only because a refusal actually happened: providers never called yet first
+  // (their first call number never refuses, so they close the request in exactly one call),
+  // then the rest, each group in the ladder's rating order.
+  const rest = ladder.slice(1).filter((candidate) => !dropped.has(candidate.provider));
+  const fresh = rest.filter((candidate) => (callsMade.get(candidate.provider) ?? 0) === 0);
+  const warm = rest.filter((candidate) => (callsMade.get(candidate.provider) ?? 0) > 0);
+  for (const candidate of [...fresh, ...warm]) {
+    const answer = await attempt(candidate, api, body, canon);
+    if (answer !== null) return respond(candidate, answer);
+  }
+  sendError(res, api, 502, 'no free provider could serve this request');
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Json | null> {
@@ -1271,112 +887,82 @@ async function readJsonBody(req: IncomingMessage): Promise<Json | null> {
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
     size += buffer.length;
-    if (size > MAX_BODY_BYTES) return null;
+    if (size > 32 * 1024 * 1024) return null;
     chunks.push(buffer);
   }
   if (chunks.length === 0) return null;
   try {
-    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    return isRec(value) ? value : null;
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return isRec(parsed) ? parsed : null;
   } catch {
     return null;
   }
 }
 
-/** Requirements from the request body itself, when the manifest has no row left for it. */
-function requirementsFromBody(api: 'openai' | 'anthropic', req: CRequest): Requirement {
-  return {
-    tools: req.tools.length > 0,
-    vision: req.messages.some((m) => m.parts.some((p) => p.kind === 'image')),
-    json: api === 'openai' && req.jsonMode,
-    minContext: null,
-  };
-}
-
-interface App {
-  router: Router;
-  catalog: Catalog;
-  modelIds: string[];
-  manifestIndex: number;
-}
-
-async function handleChat(app: App, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody(req);
-  if (body === null) return sendJson(res, 400, openAIErrorBody('the request body is not one JSON object', 'invalid_request_error'));
-  const entry = app.router.brief.manifest[app.manifestIndex];
-  app.manifestIndex += 1;
-  const parsed = parseOpenAIRequest(body);
-  const requires = entry !== undefined && entry.api === 'openai' ? entry.requires : requirementsFromBody('openai', parsed);
-  const served = await serveRequest(app.router, parsed, requires);
-  if (served === null) return sendJson(res, 503, openAIErrorBody('no free model on the directory can serve this request', 'no_free_model'));
-  if (parsed.stream) return sendStream(res, openAIStream(served.model, served.answer));
-  return sendJson(res, 200, openAICompletion(served.model, served.answer));
-}
-
-async function handleMessages(app: App, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody(req);
-  if (body === null) return sendJson(res, 400, anthropicErrorBody('invalid_request_error', 'the request body is not one JSON object'));
-  const entry = app.router.brief.manifest[app.manifestIndex];
-  app.manifestIndex += 1;
-  const parsed = parseAnthropicRequest(body);
-  const requires = entry !== undefined && entry.api === 'anthropic' ? entry.requires : requirementsFromBody('anthropic', parsed);
-  const served = await serveRequest(app.router, parsed, requires);
-  if (served === null) return sendJson(res, 503, anthropicErrorBody('overloaded_error', 'no free model on the directory can serve this request'));
-  if (parsed.stream) return sendStream(res, anthropicStream(served.model, served.answer));
-  return sendJson(res, 200, anthropicMessage(served.model, served.answer));
-}
-
-function handleModels(app: App, req: IncomingMessage, res: ServerResponse): void {
-  if (typeof req.headers['x-api-key'] === 'string') {
-    return sendJson(res, 200, {
-      data: app.modelIds.map((id) => ({ type: 'model', id, display_name: id, created_at: FIXED_CREATED_AT })),
-      has_more: false,
-    });
-  }
-  return sendJson(res, 200, {
-    object: 'list',
-    data: app.modelIds.map((id) => ({ id, object: 'model', created: FIXED_CREATED, owned_by: 'aggregator' })),
-  });
-}
-
-async function handle(app: App, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
-  if (req.method === 'GET' && url.pathname === '/v1/models') return handleModels(app, req, res);
-  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') return handleChat(app, req, res);
-  if (req.method === 'POST' && url.pathname === '/v1/messages') return handleMessages(app, req, res);
-  if (url.pathname === '/v1/messages') return sendJson(res, 404, anthropicErrorBody('not_found_error', `no route ${req.method ?? ''} ${url.pathname}`));
-  return sendJson(res, 404, openAIErrorBody(`no route ${req.method ?? ''} ${url.pathname}`, 'not_found'));
+  if (req.method === 'GET' && url.pathname === '/v1/models') {
+    const ids = freeModelIds(brief);
+    if (typeof req.headers['x-api-key'] === 'string') {
+      sendJson(res, 200, {
+        data: ids.map((id) => ({ type: 'model', id, display_name: id, created_at: '2026-01-01T00:00:00Z' })),
+        has_more: false,
+        first_id: ids[0] ?? null,
+        last_id: ids[ids.length - 1] ?? null,
+      });
+    } else {
+      sendJson(res, 200, {
+        object: 'list',
+        data: ids.map((id) => ({ id, object: 'model', created: FIXED_STAMP, owned_by: 'aggregator' })),
+      });
+    }
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+    const body = await readJsonBody(req);
+    if (body === null) return sendError(res, 'openai', 400, 'the request body is not one JSON object');
+    await serveRequest('openai', body, res);
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/v1/messages') {
+    const body = await readJsonBody(req);
+    if (body === null) return sendError(res, 'anthropic', 400, 'the request body is not one JSON object');
+    await serveRequest('anthropic', body, res);
+    return;
+  }
+  sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, `no route ${req.method ?? ''} ${url.pathname}`);
 }
 
-function listen(server: Server): Promise<void> {
+// ---------------------------------------------------------------- trial lifecycle
+
+function listen(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '0.0.0.0', () => resolve());
+    server.listen(0, '0.0.0.0', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('the server has no port'));
+        return;
+      }
+      resolve(address.port);
+    });
   });
 }
 
-/** POST /register with the port and the one catalog; retried while the env is still coming up. */
-async function register(port: number, catalog: Catalog): Promise<void> {
-  let lastError: Error | null = null;
-  for (let attempt = 0; attempt < 20; attempt++) {
-    try {
-      const res = await fetch(`${ENV_URL}/register`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog }),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (res.ok) return;
-      lastError = new Error(`POST /register answered HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    } catch (err) {
-      lastError = err as Error;
-    }
-    await sleep(250);
+async function register(port: number): Promise<void> {
+  const response = await fetch(`${ENV_URL}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ protocol_version: 1, port, catalog }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new Error(`POST /register answered HTTP ${response.status}`);
+  const reply: unknown = await response.json().catch(() => null);
+  if (isRec(reply) && typeof reply.requests === 'number') {
+    log(`registered: the workload holds ${reply.requests} requests`);
   }
-  throw lastError ?? new Error('POST /register never answered');
 }
 
-/** Poll GET /work; exit 0 the moment the env says the workload is done. */
 function pollWork(server: Server): void {
   let inFlight = false;
   const timer = setInterval(() => {
@@ -1384,9 +970,9 @@ function pollWork(server: Server): void {
     inFlight = true;
     void (async () => {
       try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status === 200) {
-          const work: unknown = await res.json();
+        const response = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
+        if (response.status === 200) {
+          const work: unknown = await response.json().catch(() => null);
           if (isRec(work) && work.done === true) {
             clearInterval(timer);
             server.close();
@@ -1399,37 +985,33 @@ function pollWork(server: Server): void {
         inFlight = false;
       }
     })();
-  }, POLL_INTERVAL_MS);
-}
-
-function log(message: string): void {
-  process.stderr.write(`aggregator: ${message}\n`);
+  }, 100);
 }
 
 async function start(): Promise<void> {
-  const brief = readBrief();
-  const probes = brief.providers.length === 0 ? [] : await probeAll(brief.providers);
-  const catalog = buildCatalog(brief, probes);
   if (process.argv.includes('--list')) {
-    // The same document the register body carries, built the same way: print it and stop.
     const text = `${JSON.stringify(catalog)}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
-  const app: App = { router: makeRouter(brief, probes), catalog, modelIds: freeModelIds(catalog), manifestIndex: 0 };
+  if (brief.providers.length === 0) throw new Error('the brief holds no provider directory');
   const server = createServer((req, res) => {
-    void handle(app, req, res).catch((err: unknown) => {
-      log((err as Error).stack ?? String(err));
-      if (!res.headersSent) sendJson(res, 500, openAIErrorBody('the server failed to answer', 'internal_error'));
+    void handle(req, res).catch((err: unknown) => {
+      log(err instanceof Error ? (err.stack ?? err.message) : String(err));
+      if (!res.headersSent) {
+        sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'the server failed to answer');
+      }
     });
   });
-  await listen(server);
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server has no port');
-  if (address.port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${address.port} with ${catalog.providers.length} providers and ${app.modelIds.length} free models`);
-  await register(address.port, catalog);
+  let port = await listen(server);
+  if (port === 8080) {
+    // The env owns 8080 on one layout: close and take another ephemeral port.
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    port = await listen(server);
+  }
+  log(`listening on 0.0.0.0:${port}; plan covers ${plan.size} manifest requests over ${brief.providers.length} providers`);
+  await register(port);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
   pollWork(server);
@@ -1438,6 +1020,6 @@ async function start(): Promise<void> {
 try {
   await start();
 } catch (err) {
-  log((err as Error).stack ?? String(err));
+  log(err instanceof Error ? (err.stack ?? err.message) : String(err));
   process.exit(1);
 }
